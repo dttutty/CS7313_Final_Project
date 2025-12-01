@@ -27,7 +27,10 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
+DG_data/
+processed_data/
+saved_models/
+saved_results/
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.

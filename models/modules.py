@@ -38,7 +38,84 @@ class TimeEncoder(nn.Module):
 
         return output
 
+class NormalizedMixedTimeEncoder(nn.Module):
+    """
+    An advanced time encoder that encodes timestamps using both fixed, interpretable frequencies 
+    (yearly, monthly, weekly, daily, hourly, minutely) and learnable frequencies.
+    """
+    def __init__(self, time_dim: int, parameter_requires_grad: bool = True, period_shortest: float = 1.0, period_longest: float = 30.44 * 24 * 60 * 60):
+        """
+        :param time_dim: int, dimension of time encodings. Must be greater than 6.
+        :param parameter_requires_grad: boolean, whether the parameter in the learnable part needs gradient.
+        """
+        super(NormalizedMixedTimeEncoder, self).__init__()
 
+        assert time_dim > 6, "time_dim must be greater than 6 to accommodate 6 fixed frequencies."
+        self.time_dim = time_dim
+        self.learnable_dim = time_dim - 6  # Reserve 6 dimensions for fixed frequencies
+
+        # === Part 1: Fixed, Interpretable Frequencies ===
+        # Define periods in seconds for our fixed frequencies
+        minute = 60
+        hour = 60 * minute
+        day = 24 * hour
+        week = 7 * day
+        month = 30.44 * day  # Average month length
+        year = 365.25 * day # Average year length (accounts for leap years)
+        
+        periods = torch.tensor([minute, hour, day, week, month, year], dtype=torch.float32)
+        # Calculate angular frequencies (w = 2 * PI / T)
+        # Shape: (6,)
+        fixed_frequencies = 2 * math.pi / periods
+        
+        # Register frequencies as a buffer. A buffer is part of the model's state,
+        # but not considered a parameter for the optimizer. It will be moved to the correct device.
+        # Shape: (1, 1, 6) for broadcasting
+        self.register_buffer('fixed_frequencies', fixed_frequencies.view(1, 1, -1))
+
+        # === Part 2: Learnable Frequencies ===
+        # This is the same as the original TimeEncoder, but for the remaining dimensions
+        self.learnable_w = nn.Linear(1, self.learnable_dim)
+        # Initialize weights with a logarithmic scale, similar to the original approach
+        w = torch.from_numpy(1 / 10 ** np.linspace(0, 9, self.learnable_dim, dtype=np.float32))
+        # T = 2 * PI / w
+        T = 2 * math.pi / w
+        # Normalize T to be in the range [period_shortest, period_longest]
+        T = (T - T.min()) / (T.max() - T.min()) * (period_longest - period_shortest) + period_shortest
+        # Convert T back to w
+        w = 2 * math.pi / T
+        self.learnable_w.weight = nn.Parameter((w).reshape(self.learnable_dim, -1))
+        self.learnable_w.bias = nn.Parameter(torch.zeros(self.learnable_dim))
+
+        if not parameter_requires_grad:
+            self.learnable_w.weight.requires_grad = False
+            self.learnable_w.bias.requires_grad = False
+
+    def forward(self, timestamps: torch.Tensor):
+        """
+        Compute time encodings of time in timestamps.
+        :param timestamps: Tensor, shape (batch_size, seq_len)
+        :return: Tensor, shape (batch_size, seq_len, time_dim)
+        """
+        # timestamps need to be unsqueezed for broadcasting with frequencies
+        # Shape: (batch_size, seq_len, 1)
+        timestamps_unsqueezed = timestamps.unsqueeze(dim=2)
+
+        # 1. Compute fixed encodings
+        # Broadcasting: (batch, seq, 1) * (1, 1, 6) -> (batch, seq, 6)
+        fixed_args = self.fixed_frequencies * timestamps_unsqueezed
+        fixed_output = torch.cos(fixed_args)
+
+        # 2. Compute learnable encodings
+        # Shape: (batch_size, seq_len, learnable_dim)
+        learnable_output = torch.cos(self.learnable_w(timestamps_unsqueezed))
+
+        # 3. Concatenate both parts to get the final embedding
+        # Shape: (batch_size, seq_len, 6 + learnable_dim) which is (batch_size, seq_len, time_dim)
+        return torch.cat([fixed_output, learnable_output], dim=-1)
+    
+    
+    
 class MergeLayer(nn.Module):
 
     def __init__(self, input_dim1: int, input_dim2: int, hidden_dim: int, output_dim: int):
