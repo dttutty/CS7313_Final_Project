@@ -23,6 +23,7 @@ lib64/
 parts/
 sdist/
 var/
+logs/
 wheels/
 *.egg-info/
 .installed.cfg
@@ -116,3 +117,7 @@ DG_data/*/*
 !DG_data/myket/*
 processed_data/*/*
 !processed_data/myket/*
+!DG_data/datasets_readme.md
+!DG_data/readme.md
+
+wandb/

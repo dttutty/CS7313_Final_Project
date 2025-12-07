@@ -4,6 +4,151 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+
+DATASET_STATS = {
+    'CanParl': {
+        'min_ts': 0.0, 'max_ts': 410227200.0, 'min_delta': 31536000.0,
+        'unique_count': 14, 'ts_type': 'yearly'
+    },
+    'Contacts': {
+        'min_ts': 0.0, 'max_ts': 2418900.0, 'min_delta': 300.0,
+        'unique_count': 8064, 'ts_type': 'standard_physical_time'
+    },
+    'enron': {
+        'min_ts': 0.0, 'max_ts': 113740399.0, 'min_delta': 1.0,
+        'unique_count': 22632, 'ts_type': 'standard_physical_time'
+    },
+    'Flights': {
+        'min_ts': 0.0, 'max_ts': 121.0, 'min_delta': 1.0,
+        'unique_count': 122, 'ts_type': 'delta'
+    },
+    'lastfm': {
+        'min_ts': 0.0, 'max_ts': 137107267.0, 'min_delta': 1.0,
+        'unique_count': 1283614, 'ts_type': 'standard_physical_time'
+    },
+    'mooc': {
+        'min_ts': 0.0, 'max_ts': 2572086.0, 'min_delta': 1.0,
+        'unique_count': 345600, 'ts_type': 'standard_physical_time'
+    },
+    'myket': {
+        'min_ts': 0.0, 'max_ts': 17021023.86, 'min_delta': 0.003, 
+        'unique_count': 693774, 'ts_type': 'high_frequency_time'
+    },
+    'reddit': {
+        'min_ts': 0.0, 'max_ts': 2678390.016, 'min_delta': 0.001, 
+        'unique_count': 669065, 'ts_type': 'high_frequency_time'
+    },
+    'SocialEvo': {
+        'min_ts': 0.0, 'max_ts': 20935623.0, 'min_delta': 1.0,
+        'unique_count': 565932, 'ts_type': 'standard_physical_time'
+    },
+    'uci': {
+        'min_ts': 0.0, 'max_ts': 16736181.0, 'min_delta': 1.0,
+        'unique_count': 58911, 'ts_type': 'standard_physical_time'
+    },
+    'UNtrade': {
+        'min_ts': 0.0, 'max_ts': 978307200.0, 'min_delta': 31536000.0,
+        'unique_count': 32, 'ts_type': 'yearly'
+    },
+    'UNvote': {
+        'min_ts': 0.0, 'max_ts': 2240611200.0, 'min_delta': 31536000.0,
+        'unique_count': 72, 
+        'ts_type': 'yearly'
+    },
+    'USLegis': {
+        'min_ts': 0.0, 'max_ts': 11.0, 'min_delta': 1.0,
+        'unique_count': 12, 'ts_type': 'delta'
+    },
+    'wikipedia': {
+        'min_ts': 0.0, 'max_ts': 2678373.0, 'min_delta': 1.0,
+        'unique_count': 152757, 'ts_type': 'standard_physical_time'
+    }
+}
+
+def get_time_encoder_args(dataset_name, default_dim):
+    if dataset_name not in DATASET_STATS:
+        raise ValueError(f"Unknown dataset: {dataset_name}.")
+        
+    stats = DATASET_STATS[dataset_name]
+    ts_type = stats['ts_type']
+    min_delta = stats['min_delta']
+    
+    args = {
+        'time_dim': default_dim,
+        'period_longest': stats['max_ts'] - stats['min_ts'],
+        'period_shortest': min_delta 
+    }
+    
+    if args['period_longest'] <= 0: args['period_longest'] = 100.0
+
+    
+    if ts_type == 'yearly':
+        args['period_shortest'] = min_delta 
+        
+        if stats['unique_count'] < 100:
+            args['time_dim'] = min(16, default_dim)
+
+    elif ts_type == 'delta':
+        args['period_shortest'] = min_delta
+        args['period_longest'] = stats['max_ts'] 
+        args['time_dim'] = min(16, stats['unique_count'] + 2) 
+
+    elif ts_type == 'high_frequency_time':
+        # 1s grained time is enough
+        args['period_shortest'] = 1.0 
+    
+    return args
+
+class NwiTimeEncoder(nn.Module):
+    """
+    A fully learnable time encoder that auto-configures based on dataset statistics.
+    It removes fixed frequencies and relies entirely on adaptive frequencies initialized 
+    within the specific time span of the dataset.
+    """
+
+
+    def __init__(self, args, parameter_requires_grad: bool = True):
+        super().__init__()
+
+        
+        self.time_dim = args['time_dim']
+        self.period_shortest = args['period_shortest']
+        self.period_longest = args['period_longest']
+
+
+        # Initialize Learnable Weights (Log-Uniform Distribution)
+        self.w = nn.Linear(1, self.time_dim)
+        
+        # Log-Uniform Initialization
+        # period range: [period_shortest, period_longest]
+        min_log_w = np.log(2 * np.pi / self.period_longest)
+        max_log_w = np.log(2 * np.pi / self.period_shortest)
+        
+        w_init = np.exp(np.linspace(min_log_w, max_log_w, self.time_dim)).astype(np.float32)
+        
+        self.w.weight = nn.Parameter(torch.from_numpy(w_init).reshape(self.time_dim, -1))
+        self.w.bias = nn.Parameter(torch.zeros(self.time_dim))
+
+        if not parameter_requires_grad:
+            self.w.weight.requires_grad = False
+            self.w.bias.requires_grad = False
+
+    def forward(self, timestamps: torch.Tensor):
+            """
+            compute time encodings of time in timestamps
+            :param timestamps: Tensor, shape (batch_size, seq_len)
+            :return: output: Tensor, shape (batch_size, seq_len, time_dim)
+            """
+            # Tensor, shape (batch_size, seq_len, 1)
+            timestamps = timestamps.unsqueeze(dim=-1)
+
+            # Tensor, shape (batch_size, seq_len, time_dim)
+            # self.w is Linear(1, time_dim), it will automatically broadcast the preceding dimensions (batch, seq)
+            output = torch.cos(self.w(timestamps))
+
+            return output
+
+
 class TimeEncoder(nn.Module):
 
     def __init__(self, time_dim: int, parameter_requires_grad: bool = True):
@@ -38,84 +183,6 @@ class TimeEncoder(nn.Module):
 
         return output
 
-class NormalizedMixedTimeEncoder(nn.Module):
-    """
-    An advanced time encoder that encodes timestamps using both fixed, interpretable frequencies 
-    (yearly, monthly, weekly, daily, hourly, minutely) and learnable frequencies.
-    """
-    def __init__(self, time_dim: int, parameter_requires_grad: bool = True, period_shortest: float = 1.0, period_longest: float = 30.44 * 24 * 60 * 60):
-        """
-        :param time_dim: int, dimension of time encodings. Must be greater than 6.
-        :param parameter_requires_grad: boolean, whether the parameter in the learnable part needs gradient.
-        """
-        super(NormalizedMixedTimeEncoder, self).__init__()
-
-        assert time_dim > 6, "time_dim must be greater than 6 to accommodate 6 fixed frequencies."
-        self.time_dim = time_dim
-        self.learnable_dim = time_dim - 6  # Reserve 6 dimensions for fixed frequencies
-
-        # === Part 1: Fixed, Interpretable Frequencies ===
-        # Define periods in seconds for our fixed frequencies
-        minute = 60
-        hour = 60 * minute
-        day = 24 * hour
-        week = 7 * day
-        month = 30.44 * day  # Average month length
-        year = 365.25 * day # Average year length (accounts for leap years)
-        
-        periods = torch.tensor([minute, hour, day, week, month, year], dtype=torch.float32)
-        # Calculate angular frequencies (w = 2 * PI / T)
-        # Shape: (6,)
-        fixed_frequencies = 2 * math.pi / periods
-        
-        # Register frequencies as a buffer. A buffer is part of the model's state,
-        # but not considered a parameter for the optimizer. It will be moved to the correct device.
-        # Shape: (1, 1, 6) for broadcasting
-        self.register_buffer('fixed_frequencies', fixed_frequencies.view(1, 1, -1))
-
-        # === Part 2: Learnable Frequencies ===
-        # This is the same as the original TimeEncoder, but for the remaining dimensions
-        self.learnable_w = nn.Linear(1, self.learnable_dim)
-        # Initialize weights with a logarithmic scale, similar to the original approach
-        w = torch.from_numpy(1 / 10 ** np.linspace(0, 9, self.learnable_dim, dtype=np.float32))
-        # T = 2 * PI / w
-        T = 2 * math.pi / w
-        # Normalize T to be in the range [period_shortest, period_longest]
-        T = (T - T.min()) / (T.max() - T.min()) * (period_longest - period_shortest) + period_shortest
-        # Convert T back to w
-        w = 2 * math.pi / T
-        self.learnable_w.weight = nn.Parameter((w).reshape(self.learnable_dim, -1))
-        self.learnable_w.bias = nn.Parameter(torch.zeros(self.learnable_dim))
-
-        if not parameter_requires_grad:
-            self.learnable_w.weight.requires_grad = False
-            self.learnable_w.bias.requires_grad = False
-
-    def forward(self, timestamps: torch.Tensor):
-        """
-        Compute time encodings of time in timestamps.
-        :param timestamps: Tensor, shape (batch_size, seq_len)
-        :return: Tensor, shape (batch_size, seq_len, time_dim)
-        """
-        # timestamps need to be unsqueezed for broadcasting with frequencies
-        # Shape: (batch_size, seq_len, 1)
-        timestamps_unsqueezed = timestamps.unsqueeze(dim=2)
-
-        # 1. Compute fixed encodings
-        # Broadcasting: (batch, seq, 1) * (1, 1, 6) -> (batch, seq, 6)
-        fixed_args = self.fixed_frequencies * timestamps_unsqueezed
-        fixed_output = torch.cos(fixed_args)
-
-        # 2. Compute learnable encodings
-        # Shape: (batch_size, seq_len, learnable_dim)
-        learnable_output = torch.cos(self.learnable_w(timestamps_unsqueezed))
-
-        # 3. Concatenate both parts to get the final embedding
-        # Shape: (batch_size, seq_len, 6 + learnable_dim) which is (batch_size, seq_len, time_dim)
-        return torch.cat([fixed_output, learnable_output], dim=-1)
-    
-    
-    
 class MergeLayer(nn.Module):
 
     def __init__(self, input_dim1: int, input_dim2: int, hidden_dim: int, output_dim: int):
@@ -283,7 +350,7 @@ class MultiHeadAttention(nn.Module):
         return output, attention_scores
 
 
-class TransformerEncoder(nn.Module):
+class TransformerEncoder(nn.Module): # this if for TCL and CAWN
 
     def __init__(self, attention_dim: int, num_heads: int, dropout: float = 0.1):
         """

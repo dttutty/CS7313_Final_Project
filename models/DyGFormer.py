@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import MultiheadAttention
 
-from models.modules import TimeEncoder
+from models.modules import TimeEncoder, NwiTimeEncoder, DATASET_STATS, get_time_encoder_args
 from utils.utils import NeighborSampler
 
 
@@ -12,7 +12,7 @@ class DyGFormer(nn.Module):
 
     def __init__(self, node_raw_features: np.ndarray, edge_raw_features: np.ndarray, neighbor_sampler: NeighborSampler,
                  time_feat_dim: int, channel_embedding_dim: int, patch_size: int = 1, num_layers: int = 2, num_heads: int = 2,
-                 dropout: float = 0.1, max_input_sequence_length: int = 512, device: str = 'cpu'):
+                 dropout: float = 0.1, max_input_sequence_length: int = 512, device: str = 'cpu', time_enconder='original', act_fn='gelu', dataset='w'):
         """
         DyGFormer model.
         :param node_raw_features: ndarray, shape (num_nodes + 1, node_feat_dim)
@@ -29,8 +29,11 @@ class DyGFormer(nn.Module):
         """
         super(DyGFormer, self).__init__()
 
-        self.node_raw_features = torch.from_numpy(node_raw_features.astype(np.float32)).to(device)
-        self.edge_raw_features = torch.from_numpy(edge_raw_features.astype(np.float32)).to(device)
+        self.register_buffer("node_raw_features",
+                     torch.from_numpy(node_raw_features.astype(np.float32)))
+        self.register_buffer("edge_raw_features",
+                            torch.from_numpy(edge_raw_features.astype(np.float32)))
+
 
         self.neighbor_sampler = neighbor_sampler
         self.node_feat_dim = self.node_raw_features.shape[1]
@@ -44,7 +47,15 @@ class DyGFormer(nn.Module):
         self.max_input_sequence_length = max_input_sequence_length
         self.device = device
 
-        self.time_encoder = TimeEncoder(time_dim=time_feat_dim)
+
+        if time_enconder == 'nwi':
+            args = get_time_encoder_args(dataset_name=dataset, default_dim=time_feat_dim)
+            self.time_feat_dim = args['time_dim']
+            self.time_encoder = NwiTimeEncoder(args=args, parameter_requires_grad=True)
+        else:
+            assert time_enconder == 'original'
+            self.time_encoder = TimeEncoder(time_dim=time_feat_dim)
+        
 
         self.neighbor_co_occurrence_feat_dim = self.channel_embedding_dim
         self.neighbor_co_occurrence_encoder = NeighborCooccurrenceEncoder(neighbor_co_occurrence_feat_dim=self.neighbor_co_occurrence_feat_dim, device=self.device)
@@ -58,10 +69,17 @@ class DyGFormer(nn.Module):
 
         self.num_channels = 4
 
-        self.transformers = nn.ModuleList([
-            TransformerEncoder(attention_dim=self.num_channels * self.channel_embedding_dim, num_heads=self.num_heads, dropout=self.dropout)
-            for _ in range(self.num_layers)
-        ])
+        if act_fn == 'gelu':
+            self.transformers = nn.ModuleList([
+                TransformerEncoder(attention_dim=self.num_channels * self.channel_embedding_dim, num_heads=self.num_heads, dropout=self.dropout)
+                for _ in range(self.num_layers)
+            ])
+        else:
+            assert act_fn == 'swiglu'
+            self.transformers = nn.ModuleList([
+                SwiGLUTransformerEncoder(attention_dim=self.num_channels * self.channel_embedding_dim, num_heads=self.num_heads, dropout=self.dropout)
+                for _ in range(self.num_layers)
+            ])
 
         self.output_layer = nn.Linear(in_features=self.num_channels * self.channel_embedding_dim, out_features=self.node_feat_dim, bias=True)
 
@@ -244,66 +262,81 @@ class DyGFormer(nn.Module):
         # three ndarrays with shape (batch_size, max_seq_length)
         return padded_nodes_neighbor_ids, padded_nodes_edge_ids, padded_nodes_neighbor_times
 
-    def get_features(self, node_interact_times: np.ndarray, padded_nodes_neighbor_ids: np.ndarray, padded_nodes_edge_ids: np.ndarray,
-                     padded_nodes_neighbor_times: np.ndarray, time_encoder: TimeEncoder):
+    def get_features(self, node_interact_times: np.ndarray,
+                     padded_nodes_neighbor_ids: np.ndarray,
+                     padded_nodes_edge_ids: np.ndarray,
+                     padded_nodes_neighbor_times: np.ndarray,
+                     time_encoder: TimeEncoder):
         """
         get node, edge and time features
-        :param node_interact_times: ndarray, shape (batch_size, )
-        :param padded_nodes_neighbor_ids: ndarray, shape (batch_size, max_seq_length)
-        :param padded_nodes_edge_ids: ndarray, shape (batch_size, max_seq_length)
-        :param padded_nodes_neighbor_times: ndarray, shape (batch_size, max_seq_length)
-        :param time_encoder: TimeEncoder, time encoder
-        :return:
         """
-        # Tensor, shape (batch_size, max_seq_length, node_feat_dim)
-        padded_nodes_neighbor_node_raw_features = self.node_raw_features[torch.from_numpy(padded_nodes_neighbor_ids)]
-        # Tensor, shape (batch_size, max_seq_length, edge_feat_dim)
-        padded_nodes_edge_raw_features = self.edge_raw_features[torch.from_numpy(padded_nodes_edge_ids)]
-        # Tensor, shape (batch_size, max_seq_length, time_feat_dim)
-        padded_nodes_neighbor_time_features = time_encoder(timestamps=torch.from_numpy(node_interact_times[:, np.newaxis] - padded_nodes_neighbor_times).float().to(self.device))
+        device = self.node_raw_features.device  # 和模型保持一致
 
-        # ndarray, set the time features to all zeros for the padded timestamp
-        padded_nodes_neighbor_time_features[torch.from_numpy(padded_nodes_neighbor_ids == 0)] = 0.0
+        ids = torch.from_numpy(padded_nodes_neighbor_ids).long().to(device)        # (B, L)
+        edge_ids = torch.from_numpy(padded_nodes_edge_ids).long().to(device)       # (B, L)
+        neighbor_times = torch.from_numpy(padded_nodes_neighbor_times).to(device)  # (B, L)
+        interact_times = torch.from_numpy(node_interact_times).to(device)          # (B,)
 
-        return padded_nodes_neighbor_node_raw_features, padded_nodes_edge_raw_features, padded_nodes_neighbor_time_features
+        # (B, L, node_feat_dim)
+        padded_nodes_neighbor_node_raw_features = self.node_raw_features[ids]
+        # (B, L, edge_feat_dim)
+        padded_nodes_edge_raw_features = self.edge_raw_features[edge_ids]
 
-    def get_patches(self, padded_nodes_neighbor_node_raw_features: torch.Tensor, padded_nodes_edge_raw_features: torch.Tensor,
-                    padded_nodes_neighbor_time_features: torch.Tensor, padded_nodes_neighbor_co_occurrence_features: torch.Tensor = None, patch_size: int = 1):
+        # (B, 1) - (B, L) -> (B, L)
+        delta_t = interact_times[:, None] - neighbor_times
+        # TimeEncoder 内部应该自己处理最后一维，你原来传的是 2D，所以这里保持 2D
+        padded_nodes_neighbor_time_features = time_encoder(
+            timestamps=delta_t.float()
+        )
+
+        # 直接用 ids == 0 做 mask，不再新建 numpy mask
+        mask = (ids == 0)
+        padded_nodes_neighbor_time_features[mask] = 0.0
+
+        return (padded_nodes_neighbor_node_raw_features,
+                padded_nodes_edge_raw_features,
+                padded_nodes_neighbor_time_features)
+
+    def get_patches(self,
+                    padded_nodes_neighbor_node_raw_features: torch.Tensor,
+                    padded_nodes_edge_raw_features: torch.Tensor,
+                    padded_nodes_neighbor_time_features: torch.Tensor,
+                    padded_nodes_neighbor_co_occurrence_features: torch.Tensor,
+                    patch_size: int = 1):
         """
         get the sequence of patches for nodes
-        :param padded_nodes_neighbor_node_raw_features: Tensor, shape (batch_size, max_seq_length, node_feat_dim)
-        :param padded_nodes_edge_raw_features: Tensor, shape (batch_size, max_seq_length, edge_feat_dim)
-        :param padded_nodes_neighbor_time_features: Tensor, shape (batch_size, max_seq_length, time_feat_dim)
-        :param padded_nodes_neighbor_co_occurrence_features: Tensor, shape (batch_size, max_seq_length, neighbor_co_occurrence_feat_dim)
-        :param patch_size: int, patch size
-        :return:
         """
-        assert padded_nodes_neighbor_node_raw_features.shape[1] % patch_size == 0
-        num_patches = padded_nodes_neighbor_node_raw_features.shape[1] // patch_size
+        B, L, _ = padded_nodes_neighbor_node_raw_features.shape
+        assert L % patch_size == 0
+        num_patches = L // patch_size
 
-        # list of Tensors with shape (num_patches, ), each Tensor with shape (batch_size, patch_size, node_feat_dim)
-        patches_nodes_neighbor_node_raw_features, patches_nodes_edge_raw_features, \
-        patches_nodes_neighbor_time_features, patches_nodes_neighbor_co_occurrence_features = [], [], [], []
+        def make_patches(x: torch.Tensor, feat_dim: int) -> torch.Tensor:
+            # x: (B, L, feat_dim)
+            # -> (B, num_patches, patch_size * feat_dim)
+            B_, L_, D_ = x.shape
+            assert D_ == feat_dim
+            x = x.reshape(B_, num_patches, patch_size, feat_dim)
+            x = x.reshape(B_, num_patches, patch_size * feat_dim)
+            return x
 
-        for patch_id in range(num_patches):
-            start_idx = patch_id * patch_size
-            end_idx = patch_id * patch_size + patch_size
-            patches_nodes_neighbor_node_raw_features.append(padded_nodes_neighbor_node_raw_features[:, start_idx: end_idx, :])
-            patches_nodes_edge_raw_features.append(padded_nodes_edge_raw_features[:, start_idx: end_idx, :])
-            patches_nodes_neighbor_time_features.append(padded_nodes_neighbor_time_features[:, start_idx: end_idx, :])
-            patches_nodes_neighbor_co_occurrence_features.append(padded_nodes_neighbor_co_occurrence_features[:, start_idx: end_idx, :])
+        patches_nodes_neighbor_node_raw_features = make_patches(
+            padded_nodes_neighbor_node_raw_features, self.node_feat_dim
+        )
+        patches_nodes_edge_raw_features = make_patches(
+            padded_nodes_edge_raw_features, self.edge_feat_dim
+        )
+        patches_nodes_neighbor_time_features = make_patches(
+            padded_nodes_neighbor_time_features, self.time_feat_dim
+        )
+        patches_nodes_neighbor_co_occurrence_features = make_patches(
+            padded_nodes_neighbor_co_occurrence_features, self.neighbor_co_occurrence_feat_dim
+        )
 
-        batch_size = len(padded_nodes_neighbor_node_raw_features)
-        # Tensor, shape (batch_size, num_patches, patch_size * node_feat_dim)
-        patches_nodes_neighbor_node_raw_features = torch.stack(patches_nodes_neighbor_node_raw_features, dim=1).reshape(batch_size, num_patches, patch_size * self.node_feat_dim)
-        # Tensor, shape (batch_size, num_patches, patch_size * edge_feat_dim)
-        patches_nodes_edge_raw_features = torch.stack(patches_nodes_edge_raw_features, dim=1).reshape(batch_size, num_patches, patch_size * self.edge_feat_dim)
-        # Tensor, shape (batch_size, num_patches, patch_size * time_feat_dim)
-        patches_nodes_neighbor_time_features = torch.stack(patches_nodes_neighbor_time_features, dim=1).reshape(batch_size, num_patches, patch_size * self.time_feat_dim)
+        return (patches_nodes_neighbor_node_raw_features,
+                patches_nodes_edge_raw_features,
+                patches_nodes_neighbor_time_features,
+                patches_nodes_neighbor_co_occurrence_features)
 
-        patches_nodes_neighbor_co_occurrence_features = torch.stack(patches_nodes_neighbor_co_occurrence_features, dim=1).reshape(batch_size, num_patches, patch_size * self.neighbor_co_occurrence_feat_dim)
-
-        return patches_nodes_neighbor_node_raw_features, patches_nodes_edge_raw_features, patches_nodes_neighbor_time_features, patches_nodes_neighbor_co_occurrence_features
 
     def set_neighbor_sampler(self, neighbor_sampler: NeighborSampler):
         """
@@ -316,146 +349,210 @@ class DyGFormer(nn.Module):
             assert self.neighbor_sampler.seed is not None
             self.neighbor_sampler.reset_random_state()
 
-
 class NeighborCooccurrenceEncoder(nn.Module):
 
     def __init__(self, neighbor_co_occurrence_feat_dim: int, device: str = 'cpu'):
-        """
-        Neighbor co-occurrence encoder.
-        :param neighbor_co_occurrence_feat_dim: int, dimension of neighbor co-occurrence features (encodings)
-        :param device: str, device
-        """
-        super(NeighborCooccurrenceEncoder, self).__init__()
+        super().__init__()
         self.neighbor_co_occurrence_feat_dim = neighbor_co_occurrence_feat_dim
-        self.device = device
+        self.device = torch.device(device)
 
         self.neighbor_co_occurrence_encode_layer = nn.Sequential(
             nn.Linear(in_features=1, out_features=self.neighbor_co_occurrence_feat_dim),
             nn.ReLU(),
-            nn.Linear(in_features=self.neighbor_co_occurrence_feat_dim, out_features=self.neighbor_co_occurrence_feat_dim))
+            nn.Linear(
+                in_features=self.neighbor_co_occurrence_feat_dim,
+                out_features=self.neighbor_co_occurrence_feat_dim,
+            ),
+        )
 
-    def count_nodes_appearances(self, src_padded_nodes_neighbor_ids: np.ndarray, dst_padded_nodes_neighbor_ids: np.ndarray):
+    @torch.no_grad()
+    def count_nodes_appearances(
+        self,
+        src_padded_nodes_neighbor_ids: np.ndarray,
+        dst_padded_nodes_neighbor_ids: np.ndarray,
+    ):
         """
-        count the appearances of nodes in the sequences of source and destination nodes
-        :param src_padded_nodes_neighbor_ids: ndarray, shape (batch_size, src_max_seq_length)
-        :param dst_padded_nodes_neighbor_ids:: ndarray, shape (batch_size, dst_max_seq_length)
-        :return:
+        :param src_padded_nodes_neighbor_ids: ndarray, (B, src_L)
+        :param dst_padded_nodes_neighbor_ids: ndarray, (B, dst_L)
         """
-        # two lists to store the appearances of source and destination nodes
-        src_padded_nodes_appearances, dst_padded_nodes_appearances = [], []
-        # src_padded_node_neighbor_ids, ndarray, shape (src_max_seq_length, )
-        # dst_padded_node_neighbor_ids, ndarray, shape (dst_max_seq_length, )
-        for src_padded_node_neighbor_ids, dst_padded_node_neighbor_ids in zip(src_padded_nodes_neighbor_ids, dst_padded_nodes_neighbor_ids):
 
-            # src_unique_keys, ndarray, shape (num_src_unique_keys, )
-            # src_inverse_indices, ndarray, shape (src_max_seq_length, )
-            # src_counts, ndarray, shape (num_src_unique_keys, )
-            # we can use src_unique_keys[src_inverse_indices] to reconstruct the original input, and use src_counts[src_inverse_indices] to get counts of the original input
-            src_unique_keys, src_inverse_indices, src_counts = np.unique(src_padded_node_neighbor_ids, return_inverse=True, return_counts=True)
-            # Tensor, shape (src_max_seq_length, )
-            src_padded_node_neighbor_counts_in_src = torch.from_numpy(src_counts[src_inverse_indices]).float().to(self.device)
-            # dictionary, store the mapping relation from unique neighbor id to its appearances for the source node
-            src_mapping_dict = dict(zip(src_unique_keys, src_counts))
+        # 统一转 tensor + device
+        src_ids = torch.from_numpy(src_padded_nodes_neighbor_ids).long().to(self.device)
+        dst_ids = torch.from_numpy(dst_padded_nodes_neighbor_ids).long().to(self.device)
 
-            # dst_unique_keys, ndarray, shape (num_dst_unique_keys, )
-            # dst_inverse_indices, ndarray, shape (dst_max_seq_length, )
-            # dst_counts, ndarray, shape (num_dst_unique_keys, )
-            # we can use dst_unique_keys[dst_inverse_indices] to reconstruct the original input, and use dst_counts[dst_inverse_indices] to get counts of the original input
-            dst_unique_keys, dst_inverse_indices, dst_counts = np.unique(dst_padded_node_neighbor_ids, return_inverse=True, return_counts=True)
-            # Tensor, shape (dst_max_seq_length, )
-            dst_padded_node_neighbor_counts_in_dst = torch.from_numpy(dst_counts[dst_inverse_indices]).float().to(self.device)
-            # dictionary, store the mapping relation from unique neighbor id to its appearances for the destination node
-            dst_mapping_dict = dict(zip(dst_unique_keys, dst_counts))
+        B, src_L = src_ids.shape
+        B2, dst_L = dst_ids.shape
+        assert B == B2
 
-            # we need to use copy() to avoid the modification of src_padded_node_neighbor_ids
-            # Tensor, shape (src_max_seq_length, )
-            src_padded_node_neighbor_counts_in_dst = torch.from_numpy(src_padded_node_neighbor_ids.copy()).apply_(lambda neighbor_id: dst_mapping_dict.get(neighbor_id, 0.0)).float().to(self.device)
-            # Tensor, shape (src_max_seq_length, 2)
-            src_padded_nodes_appearances.append(torch.stack([src_padded_node_neighbor_counts_in_src, src_padded_node_neighbor_counts_in_dst], dim=1))
+        src_padded_nodes_appearances = []
+        dst_padded_nodes_appearances = []
 
-            # we need to use copy() to avoid the modification of dst_padded_node_neighbor_ids
-            # Tensor, shape (dst_max_seq_length, )
-            dst_padded_node_neighbor_counts_in_src = torch.from_numpy(dst_padded_node_neighbor_ids.copy()).apply_(lambda neighbor_id: src_mapping_dict.get(neighbor_id, 0.0)).float().to(self.device)
-            # Tensor, shape (dst_max_seq_length, 2)
-            dst_padded_nodes_appearances.append(torch.stack([dst_padded_node_neighbor_counts_in_src, dst_padded_node_neighbor_counts_in_dst], dim=1))
+        for b in range(B):
+            src_seq = src_ids[b]  # (src_L,)
+            dst_seq = dst_ids[b]  # (dst_L,)
 
-        # Tensor, shape (batch_size, src_max_seq_length, 2)
-        src_padded_nodes_appearances = torch.stack(src_padded_nodes_appearances, dim=0)
-        # Tensor, shape (batch_size, dst_max_seq_length, 2)
-        dst_padded_nodes_appearances = torch.stack(dst_padded_nodes_appearances, dim=0)
+            all_ids, inverse = torch.unique(
+                torch.cat([src_seq, dst_seq]), return_inverse=True
+            )
+            inv_src = inverse[:src_L]
+            inv_dst = inverse[src_L:]
 
-        # set the appearances of the padded node (with zero index) to zeros
-        # Tensor, shape (batch_size, src_max_seq_length, 2)
-        src_padded_nodes_appearances[torch.from_numpy(src_padded_nodes_neighbor_ids == 0)] = 0.0
-        # Tensor, shape (batch_size, dst_max_seq_length, 2)
-        dst_padded_nodes_appearances[torch.from_numpy(dst_padded_nodes_neighbor_ids == 0)] = 0.0
+            K = all_ids.numel()
+
+            src_counts = torch.bincount(inv_src, minlength=K)  # (K,)
+            dst_counts = torch.bincount(inv_dst, minlength=K)  # (K,)
+
+            src_in_src = src_counts[inv_src]  # (src_L,)
+            src_in_dst = dst_counts[inv_src]  # (src_L,)
+
+            dst_in_src = src_counts[inv_dst]  # (dst_L,)
+            dst_in_dst = dst_counts[inv_dst]  # (dst_L,)
+
+            src_padded_nodes_appearances.append(
+                torch.stack([src_in_src, src_in_dst], dim=-1)
+            )  # (src_L, 2)
+            dst_padded_nodes_appearances.append(
+                torch.stack([dst_in_src, dst_in_dst], dim=-1)
+            )  # (dst_L, 2)
+
+        src_padded_nodes_appearances = torch.stack(
+            src_padded_nodes_appearances, dim=0
+        ).float()  # (B, src_L, 2)
+        dst_padded_nodes_appearances = torch.stack(
+            dst_padded_nodes_appearances, dim=0
+        ).float()  # (B, dst_L, 2)
+
+        # padding id == 0 的位置置 0
+        src_padded_nodes_appearances[src_ids == 0] = 0.0
+        dst_padded_nodes_appearances[dst_ids == 0] = 0.0
 
         return src_padded_nodes_appearances, dst_padded_nodes_appearances
 
-    def forward(self, src_padded_nodes_neighbor_ids: np.ndarray, dst_padded_nodes_neighbor_ids: np.ndarray):
-        """
-        compute the neighbor co-occurrence features of nodes in src_padded_nodes_neighbor_ids and dst_padded_nodes_neighbor_ids
-        :param src_padded_nodes_neighbor_ids: ndarray, shape (batch_size, src_max_seq_length)
-        :param dst_padded_nodes_neighbor_ids:: ndarray, shape (batch_size, dst_max_seq_length)
-        :return:
-        """
-        # src_padded_nodes_appearances, Tensor, shape (batch_size, src_max_seq_length, 2)
-        # dst_padded_nodes_appearances, Tensor, shape (batch_size, dst_max_seq_length, 2)
-        src_padded_nodes_appearances, dst_padded_nodes_appearances = self.count_nodes_appearances(src_padded_nodes_neighbor_ids=src_padded_nodes_neighbor_ids,
-                                                                                                  dst_padded_nodes_neighbor_ids=dst_padded_nodes_neighbor_ids)
+    def forward(self, src_padded_nodes_neighbor_ids: np.ndarray,
+                dst_padded_nodes_neighbor_ids: np.ndarray):
 
-        # sum the neighbor co-occurrence features in the sequence of source and destination nodes
-        # Tensor, shape (batch_size, src_max_seq_length, neighbor_co_occurrence_feat_dim)
-        src_padded_nodes_neighbor_co_occurrence_features = self.neighbor_co_occurrence_encode_layer(src_padded_nodes_appearances.unsqueeze(dim=-1)).sum(dim=2)
-        # Tensor, shape (batch_size, dst_max_seq_length, neighbor_co_occurrence_feat_dim)
-        dst_padded_nodes_neighbor_co_occurrence_features = self.neighbor_co_occurrence_encode_layer(dst_padded_nodes_appearances.unsqueeze(dim=-1)).sum(dim=2)
+        src_padded_nodes_appearances, dst_padded_nodes_appearances = \
+            self.count_nodes_appearances(
+                src_padded_nodes_neighbor_ids=src_padded_nodes_neighbor_ids,
+                dst_padded_nodes_neighbor_ids=dst_padded_nodes_neighbor_ids,
+            )
 
-        # src_padded_nodes_neighbor_co_occurrence_features, Tensor, shape (batch_size, src_max_seq_length, neighbor_co_occurrence_feat_dim)
-        # dst_padded_nodes_neighbor_co_occurrence_features, Tensor, shape (batch_size, dst_max_seq_length, neighbor_co_occurrence_feat_dim)
-        return src_padded_nodes_neighbor_co_occurrence_features, dst_padded_nodes_neighbor_co_occurrence_features
+        src_feat = self.neighbor_co_occurrence_encode_layer(
+            src_padded_nodes_appearances.unsqueeze(-1)
+        ).sum(dim=2)
+        dst_feat = self.neighbor_co_occurrence_encode_layer(
+            dst_padded_nodes_appearances.unsqueeze(-1)
+        ).sum(dim=2)
 
+        return src_feat, dst_feat
 
 class TransformerEncoder(nn.Module):
 
     def __init__(self, attention_dim: int, num_heads: int, dropout: float = 0.1):
-        """
-        Transformer encoder.
-        :param attention_dim: int, dimension of the attention vector
-        :param num_heads: int, number of attention heads
-        :param dropout: float, dropout rate
-        """
-        super(TransformerEncoder, self).__init__()
-        # use the MultiheadAttention implemented by PyTorch
-        self.multi_head_attention = MultiheadAttention(embed_dim=attention_dim, num_heads=num_heads, dropout=dropout)
+        super().__init__()
+        self.multi_head_attention = MultiheadAttention(
+            embed_dim=attention_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,            # added by sqp17
+        )
 
         self.dropout = nn.Dropout(dropout)
 
         self.linear_layers = nn.ModuleList([
-            nn.Linear(in_features=attention_dim, out_features=4 * attention_dim),
-            nn.Linear(in_features=4 * attention_dim, out_features=attention_dim)
+            nn.Linear(attention_dim, 4 * attention_dim),
+            nn.Linear(4 * attention_dim, attention_dim),
         ])
+        self.norm_layers = nn.ModuleList([
+            nn.LayerNorm(attention_dim),
+            nn.LayerNorm(attention_dim),
+        ])
+
+    def forward(self, inputs: torch.Tensor):
+        # inputs: (B, num_patches, attention_dim)
+        x = self.norm_layers[0](inputs) # batch_first, no need to transpose
+        hidden_states, _ = self.multi_head_attention(
+            query=x, key=x, value=x
+        )                      
+        outputs = inputs + self.dropout(hidden_states)
+
+        hidden_states = self.linear_layers[1](
+            self.dropout(F.gelu(self.linear_layers[0](self.norm_layers[1](outputs))))
+        )
+        outputs = outputs + self.dropout(hidden_states)
+        return outputs
+
+
+
+class SwiGLU(nn.Module):
+    """
+    x: [..., 2 * hidden_dim]
+    1st half: gate (SiLU)
+    2nd half: up_proj
+    Then output = SiLU(gate) * up_proj
+    """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up_proj = x.chunk(2, dim=-1)
+        return F.silu(gate) * up_proj
+
+
+class SwiGLUTransformerEncoder(nn.Module):
+
+    def __init__(self, attention_dim: int, num_heads: int, dropout: float = 0.1):
+        super(SwiGLUTransformerEncoder, self).__init__()
+        self.attention_dim = attention_dim
+
+        # Multi-head Attention
+        self.multi_head_attention = MultiheadAttention(
+            embed_dim=attention_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=False,  
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        # LayerNorm (pre-norm)
         self.norm_layers = nn.ModuleList([
             nn.LayerNorm(attention_dim),
             nn.LayerNorm(attention_dim)
         ])
 
-    def forward(self, inputs: torch.Tensor):
+        # ---SwiGLU FFN---
+        # traditional ffn dimension is 4 * attention_dim, so we keep it here
+        hidden_dim = 4 * attention_dim
+        # increase to 2 * hidden_dim for SwiGLU
+        self.ffn_gate_proj = nn.Linear(attention_dim, 2 * hidden_dim, bias=False)
+        self.swiglu = SwiGLU()
+        # down projection to attention_dim
+        self.ffn_down_proj = nn.Linear(hidden_dim, attention_dim, bias=False)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """
-        encode the inputs by Transformer encoder
-        :param inputs: Tensor, shape (batch_size, num_patches, self.attention_dim)
-        :return:
+        inputs: (batch_size, num_patches, attention_dim)
         """
-        # note that the MultiheadAttention module accept input data with shape (seq_length, batch_size, input_dim), so we need to transpose the input
-        # Tensor, shape (num_patches, batch_size, self.attention_dim)
-        transposed_inputs = inputs.transpose(0, 1)
-        # Tensor, shape (batch_size, num_patches, self.attention_dim)
-        transposed_inputs = self.norm_layers[0](transposed_inputs)
-        # Tensor, shape (batch_size, num_patches, self.attention_dim)
-        hidden_states = self.multi_head_attention(query=transposed_inputs, key=transposed_inputs, value=transposed_inputs)[0].transpose(0, 1)
-        # Tensor, shape (batch_size, num_patches, self.attention_dim)
-        outputs = inputs + self.dropout(hidden_states)
-        # Tensor, shape (batch_size, num_patches, self.attention_dim)
-        hidden_states = self.linear_layers[1](self.dropout(F.gelu(self.linear_layers[0](self.norm_layers[1](outputs)))))
-        # Tensor, shape (batch_size, num_patches, self.attention_dim)
-        outputs = outputs + self.dropout(hidden_states)
-        return outputs
+        # MultiheadAttention default inpurt: (seq_len, batch_size, dim)
+        x = inputs.transpose(0, 1)  # (num_patches, batch_size, dim)
+
+        # --- Attention sublayer（pre-norm + resnet）---
+        attn_input = self.norm_layers[0](x)
+        attn_output, _ = self.multi_head_attention(
+            query=attn_input,
+            key=attn_input,
+            value=attn_input,
+        )  # (num_patches, batch_size, dim)
+        x = x + self.dropout(attn_output)
+
+        # transpose back t0 (batch_size, num_patches, dim) for FFN
+        x = x.transpose(0, 1)  # (B, L, D)
+
+        # --- FFN + SwiGLU sublayer（pre-norm + resnet）---
+        residual = x
+        ffn_input = self.norm_layers[1](x)          # (B, L, D)
+        ffn_hidden = self.ffn_gate_proj(ffn_input)  # (B, L, 2 * hidden_dim)
+        ffn_hidden = self.swiglu(ffn_hidden)        # (B, L, hidden_dim)
+        ffn_output = self.ffn_down_proj(ffn_hidden) # (B, L, D)
+        ffn_output = self.dropout(ffn_output)
+
+        x = residual + ffn_output                   # (B, L, D)
+        return x

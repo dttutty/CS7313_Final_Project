@@ -9,6 +9,7 @@ import shutil
 import json
 import torch
 import torch.nn as nn
+import wandb
 
 from models.TGAT import TGAT
 from models.MemoryModel import MemoryModel, compute_src_dst_node_time_shifts
@@ -65,6 +66,13 @@ if __name__ == "__main__":
     for run in range(args.num_runs):
 
         set_random_seed(seed=run)
+        wandb.init(
+            project="DyGFormer-LinkPrediction",
+            group=f"{args.dataset_name}_{args.model_name}_{args.time_encoder}_{args.act_fn}_{args.negative_sample_strategy}",
+            name=f"seed_{run}",
+            config=args,  # This automatically tracks all args as hyperparameters
+            reinit=True
+        )
 
         args.seed = run
         args.save_model_name = f'{args.model_name}_seed{args.seed}'
@@ -73,9 +81,9 @@ if __name__ == "__main__":
         logging.basicConfig(level=logging.INFO)
         logger = logging.getLogger()
         logger.setLevel(logging.DEBUG)
-        os.makedirs(f"./logs/{args.model_name}/{args.dataset_name}/{args.save_model_name}/", exist_ok=True)
+        os.makedirs(f"./logs/{args.model_name}/{args.time_encoder}/{args.act_fn}/{args.dataset_name}/{args.negative_sample_strategy}/{args.save_model_name}/", exist_ok=True)
         # create file handler that logs debug and higher level messages
-        fh = logging.FileHandler(f"./logs/{args.model_name}/{args.dataset_name}/{args.save_model_name}/{str(time.time())}.log")
+        fh = logging.FileHandler(f"./logs/{args.model_name}/{args.time_encoder}/{args.act_fn}/{args.dataset_name}/{args.negative_sample_strategy}/{args.save_model_name}/{str(time.time())}.log")
         fh.setLevel(logging.DEBUG)
         # create console handler with a higher log level
         ch = logging.StreamHandler()
@@ -120,7 +128,7 @@ if __name__ == "__main__":
             dynamic_backbone = DyGFormer(node_raw_features=node_raw_features, edge_raw_features=edge_raw_features, neighbor_sampler=train_neighbor_sampler,
                                          time_feat_dim=args.time_feat_dim, channel_embedding_dim=args.channel_embedding_dim, patch_size=args.patch_size,
                                          num_layers=args.num_layers, num_heads=args.num_heads, dropout=args.dropout,
-                                         max_input_sequence_length=args.max_input_sequence_length, device=args.device)
+                                         max_input_sequence_length=args.max_input_sequence_length, device=args.device, time_enconder=args.time_encoder, act_fn=args.act_fn, dataset=args.dataset_name)
         else:
             raise ValueError(f"Wrong value for model_name {args.model_name}!")
         link_predictor = MergeLayer(input_dim1=node_raw_features.shape[1], input_dim2=node_raw_features.shape[1],
@@ -134,7 +142,7 @@ if __name__ == "__main__":
 
         model = convert_to_gpu(model, device=args.device)
 
-        save_model_folder = f"./saved_models/{args.model_name}/{args.dataset_name}/{args.save_model_name}/"
+        save_model_folder = f"./saved_models/{args.model_name}/{args.time_encoder}/{args.act_fn}/{args.dataset_name}/{args.negative_sample_strategy}/{args.save_model_name}/"
         shutil.rmtree(save_model_folder, ignore_errors=True)
         os.makedirs(save_model_folder, exist_ok=True)
 
@@ -255,6 +263,7 @@ if __name__ == "__main__":
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                wandb.log({"train/batch_loss": loss.item()})
 
                 train_idx_data_loader_tqdm.set_description(f'Epoch: {epoch + 1}, train for the {batch_idx + 1}-th batch, train loss: {loss.item()}')
 
@@ -307,6 +316,30 @@ if __name__ == "__main__":
             logger.info(f'new node validate loss: {np.mean(new_node_val_losses):.4f}')
             for metric_name in new_node_val_metrics[0].keys():
                 logger.info(f'new node validate {metric_name}, {np.mean([new_node_val_metric[metric_name] for new_node_val_metric in new_node_val_metrics]):.4f}')
+                
+            # --- [Add WandB Log Epoch Metrics] ---
+            # Aggregate metrics
+            epoch_log = {
+                "epoch": epoch + 1,
+                "train/loss_epoch": np.mean(train_losses),
+                "val/loss": np.mean(val_losses),
+                "val/new_node_loss": np.mean(new_node_val_losses),
+                "lr": optimizer.param_groups[0]["lr"]
+            }
+
+            # Add Train Metrics (Average Precision, AUC, etc.)
+            for metric_name in train_metrics[0].keys():
+                epoch_log[f"train/{metric_name}"] = np.mean([m[metric_name] for m in train_metrics])
+
+            # Add Val Metrics
+            for metric_name in val_metrics[0].keys():
+                epoch_log[f"val/{metric_name}"] = np.mean([m[metric_name] for m in val_metrics])
+            
+            # Add New Node Val Metrics
+            for metric_name in new_node_val_metrics[0].keys():
+                epoch_log[f"val_new_node/{metric_name}"] = np.mean([m[metric_name] for m in new_node_val_metrics])
+
+            wandb.log(epoch_log)
 
             # perform testing once after test_interval_epochs
             if (epoch + 1) % args.test_interval_epochs == 0:
@@ -467,12 +500,26 @@ if __name__ == "__main__":
             }
         result_json = json.dumps(result_json, indent=4)
 
-        save_result_folder = f"./saved_results/{args.model_name}/{args.dataset_name}"
+        save_result_folder = f"./saved_results/{args.model_name}/{args.time_encoder}/{args.act_fn}/{args.dataset_name}/{args.negative_sample_strategy}"
         os.makedirs(save_result_folder, exist_ok=True)
         save_result_path = os.path.join(save_result_folder, f"{args.save_model_name}.json")
 
         with open(save_result_path, 'w') as file:
             file.write(result_json)
+            
+            
+        # --- [Add WandB Log Test & Finish] ---
+        # Log final test metrics for this seed
+        test_log = {}
+        for metric_name in test_metric_dict:
+            test_log[f"test/{metric_name}"] = test_metric_dict[metric_name]
+        
+        for metric_name in new_node_test_metric_dict:
+            test_log[f"test_new_node/{metric_name}"] = new_node_test_metric_dict[metric_name]
+            
+        wandb.log(test_log)
+        wandb.finish()
+        # -------------------------------------
 
     # store the average metrics at the log of the last run
     logger.info(f'metrics over {args.num_runs} runs:')
