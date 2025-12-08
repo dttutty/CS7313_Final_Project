@@ -10,51 +10,23 @@ DATASET_STATS = {
         'min_ts': 0.0, 'max_ts': 410227200.0, 'min_delta': 31536000.0,
         'unique_count': 14, 'ts_type': 'yearly'
     },
-    'Contacts': {
-        'min_ts': 0.0, 'max_ts': 2418900.0, 'min_delta': 300.0,
-        'unique_count': 8064, 'ts_type': 'standard_physical_time'
-    },
-    'enron': {
-        'min_ts': 0.0, 'max_ts': 113740399.0, 'min_delta': 1.0,
-        'unique_count': 22632, 'ts_type': 'standard_physical_time'
-    },
-    'Flights': {
-        'min_ts': 0.0, 'max_ts': 121.0, 'min_delta': 1.0,
-        'unique_count': 122, 'ts_type': 'delta'
-    },
-    'lastfm': {
-        'min_ts': 0.0, 'max_ts': 137107267.0, 'min_delta': 1.0,
-        'unique_count': 1283614, 'ts_type': 'standard_physical_time'
-    },
+
+
     'mooc': {
         'min_ts': 0.0, 'max_ts': 2572086.0, 'min_delta': 1.0,
         'unique_count': 345600, 'ts_type': 'standard_physical_time'
     },
-    'myket': {
-        'min_ts': 0.0, 'max_ts': 17021023.86, 'min_delta': 0.003, 
-        'unique_count': 693774, 'ts_type': 'high_frequency_time'
-    },
+
     'reddit': {
         'min_ts': 0.0, 'max_ts': 2678390.016, 'min_delta': 0.001, 
         'unique_count': 669065, 'ts_type': 'high_frequency_time'
     },
-    'SocialEvo': {
-        'min_ts': 0.0, 'max_ts': 20935623.0, 'min_delta': 1.0,
-        'unique_count': 565932, 'ts_type': 'standard_physical_time'
-    },
+
     'uci': {
         'min_ts': 0.0, 'max_ts': 16736181.0, 'min_delta': 1.0,
         'unique_count': 58911, 'ts_type': 'standard_physical_time'
     },
-    'UNtrade': {
-        'min_ts': 0.0, 'max_ts': 978307200.0, 'min_delta': 31536000.0,
-        'unique_count': 32, 'ts_type': 'yearly'
-    },
-    'UNvote': {
-        'min_ts': 0.0, 'max_ts': 2240611200.0, 'min_delta': 31536000.0,
-        'unique_count': 72, 
-        'ts_type': 'yearly'
-    },
+
     'USLegis': {
         'min_ts': 0.0, 'max_ts': 11.0, 'min_delta': 1.0,
         'unique_count': 12, 'ts_type': 'delta'

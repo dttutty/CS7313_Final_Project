@@ -270,7 +270,7 @@ class DyGFormer(nn.Module):
         """
         get node, edge and time features
         """
-        device = self.node_raw_features.device  # 和模型保持一致
+        device = self.node_raw_features.device 
 
         ids = torch.from_numpy(padded_nodes_neighbor_ids).long().to(device)        # (B, L)
         edge_ids = torch.from_numpy(padded_nodes_edge_ids).long().to(device)       # (B, L)
@@ -284,12 +284,10 @@ class DyGFormer(nn.Module):
 
         # (B, 1) - (B, L) -> (B, L)
         delta_t = interact_times[:, None] - neighbor_times
-        # TimeEncoder 内部应该自己处理最后一维，你原来传的是 2D，所以这里保持 2D
         padded_nodes_neighbor_time_features = time_encoder(
             timestamps=delta_t.float()
         )
 
-        # 直接用 ids == 0 做 mask，不再新建 numpy mask
         mask = (ids == 0)
         padded_nodes_neighbor_time_features[mask] = 0.0
 
@@ -376,7 +374,6 @@ class NeighborCooccurrenceEncoder(nn.Module):
         :param dst_padded_nodes_neighbor_ids: ndarray, (B, dst_L)
         """
 
-        # 统一转 tensor + device
         src_ids = torch.from_numpy(src_padded_nodes_neighbor_ids).long().to(self.device)
         dst_ids = torch.from_numpy(dst_padded_nodes_neighbor_ids).long().to(self.device)
 
@@ -422,7 +419,6 @@ class NeighborCooccurrenceEncoder(nn.Module):
             dst_padded_nodes_appearances, dim=0
         ).float()  # (B, dst_L, 2)
 
-        # padding id == 0 的位置置 0
         src_padded_nodes_appearances[src_ids == 0] = 0.0
         dst_padded_nodes_appearances[dst_ids == 0] = 0.0
 

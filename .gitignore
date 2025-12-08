@@ -121,3 +121,4 @@ processed_data/*/*
 !DG_data/readme.md
 
 wandb/
+wandb_analysis/
