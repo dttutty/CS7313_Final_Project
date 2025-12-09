@@ -166,17 +166,14 @@ saved_results/
 
 To aggregate metrics into CSV tables:
 
-```
-cd saved_results/DyGFormer/
-python aggregate_metrics.py
-```
+`python aggregate_metrics.py`
 
 To inspect which metrics are logged in wandb:
 
 `python inspect_wandb_run_columns.py`
 To plot validation AP convergence curves:
 
-`python wandb_api_plot5.py`
+`python wandb_api_plot.py`
 
 The generated plots will be saved to `wandb_analysis/`
 
