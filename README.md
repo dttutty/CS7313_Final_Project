@@ -164,18 +164,9 @@ saved_results/
     ...
 ```
 
-To aggregate metrics into CSV tables:
+To aggregate metrics into CSV tables: `python aggregate_metrics.py`
 
-`python aggregate_metrics.py`
+To inspect which metrics are logged in wandb: `python inspect_wandb_run_columns.py`
 
-To inspect which metrics are logged in wandb:
-
-`python inspect_wandb_run_columns.py`
-
-
-To plot validation AP convergence curves:
-
-`python wandb_api_plot.py`
-
-The generated plots will be saved to `wandb_analysis/`
+To plot validation AP convergence curves: `python wandb_api_plot.py`, the generated plots will be saved to `wandb_analysis/`
 
