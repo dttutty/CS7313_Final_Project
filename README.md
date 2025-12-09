@@ -171,6 +171,8 @@ To aggregate metrics into CSV tables:
 To inspect which metrics are logged in wandb:
 
 `python inspect_wandb_run_columns.py`
+
+
 To plot validation AP convergence curves:
 
 `python wandb_api_plot.py`
