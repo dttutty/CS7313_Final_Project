@@ -82,7 +82,7 @@ The NWI time encoder uses simple dataset-level statistics.
 cd preprocess_data/
 python data_statistics.py
 ```
-Use the printed statistics to configure the NWI time encoder in models/modules.py. After this, you can use --time_encoder nwi during training.
+Use the printed statistics to configure the NWI time encoder in `models/modules.py`. After this, you can use `--time_encoder nwi` during training.
 
 ---
 
